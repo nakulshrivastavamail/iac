@@ -135,7 +135,7 @@ terraform destroy -auto-approve && terraform apply
 These commands show what `k8s-setup.yml` executes on each node.
 Do not run these manually — use `ansible-playbook k8s-setup.yml` instead.
 
-### Install prerequisites (line 31)
+### Install prerequisites (line 32)
 ```bash
 sudo apt-get update
 sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
@@ -155,7 +155,7 @@ br_netfilter
 EOF
 ```
 
-### Set sysctl (line 61)
+### Set sysctl (line 62)
 ```bash
 echo "net.bridge.bridge-nf-call-iptables=1" | sudo tee -a /etc/sysctl.d/k8s.conf
 echo "net.bridge.bridge-nf-call-ip6tables=1" | sudo tee -a /etc/sysctl.d/k8s.conf
@@ -163,18 +163,18 @@ echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.d/k8s.conf
 sudo sysctl --system
 ```
 
-### Disable swap (line 69)
+### Disable swap (line 74)
 ```bash
 sudo swapoff -a
 sudo sed -i '/swap/d' /etc/fstab
 ```
 
-### Install containerd (line 77)
+### Install containerd (line 78)
 ```bash
 sudo apt-get install -y containerd
 ```
 
-### Configure containerd (line 83-94)
+### Configure containerd (line 85-112)
 ```bash
 sudo mkdir -p /etc/containerd
 sudo containerd config default | sudo tee /etc/containerd/config.toml
@@ -183,7 +183,7 @@ sudo systemctl restart containerd
 sudo systemctl enable containerd
 ```
 
-### Add K8s repo (line 103-114)
+### Add K8s repo (line 115-132)
 ```bash
 sudo mkdir -p /etc/apt/keyrings
 curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key \
@@ -193,7 +193,7 @@ echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
   | sudo tee /etc/apt/sources.list.d/kubernetes.list
 ```
 
-### Install K8s packages (line 119)
+### Install K8s packages (line 134-155)
 ```bash
 sudo apt-get update
 sudo apt-get install -y kubelet kubeadm kubectl
@@ -203,7 +203,7 @@ sudo systemctl enable kubelet
 
 ### --- Control plane only ---
 
-### Init cluster (line 146)
+### Init cluster (line 164)
 ```bash
 sudo kubeadm init \
   --apiserver-advertise-address=192.168.122.10 \
@@ -211,26 +211,26 @@ sudo kubeadm init \
   --node-name=k8s-control-plane
 ```
 
-### Setup kubectl (line 154-164)
+### Setup kubectl (line 181-196)
 ```bash
 mkdir -p /home/kube/.kube
 sudo cp /etc/kubernetes/admin.conf /home/kube/.kube/config
 sudo chown kube:kube /home/kube/.kube/config
 ```
 
-### Install Flannel (line 166)
+### Install Flannel (line 198)
 ```bash
 kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
 ```
 
-### Get join command (line 172)
+### Get join command (line 205)
 ```bash
 kubeadm token create --print-join-command
 ```
 
 ### --- Workers only ---
 
-### Join cluster (line 188)
+### Join cluster (line 215)
 ```bash
 sudo kubeadm join 192.168.122.10:6443 \
   --token abc123 \

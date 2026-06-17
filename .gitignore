@@ -1,0 +1,29 @@
+# Local directory for cached providers and modules
+.terraform/
+
+# Distributed lock files
+.terraform.lock.hcl
+
+#Main state files and automatic backup files
+*.tfstate
+*.tfstate.*
+
+# Crash logs
+crash.log
+
+# Secret / environment-specific variable files
+*.tfvars
+*.tfvars.json
+
+# Local overrides
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+
+# Python virtual environment
+.venv/
+venv/
+ENV/
+env/

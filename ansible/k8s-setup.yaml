@@ -1,0 +1,259 @@
+---
+# K8s Cluster Setup Playbook
+# Deploys a Kubernetes cluster using kubeadm with containerd and Flannel CNI
+# Usage: ansible-playbook k8s-setup.yml
+
+- name: Pre-flight checks
+  hosts: all
+  tasks:
+    - name: Verify internet connectivity
+      uri:
+        url: https://pkgs.k8s.io
+        method: HEAD
+        timeout: 10
+      register: internet_check
+      failed_when: false
+
+    - name: Warn if no internet
+      fail:
+        msg: >
+          Cannot reach pkgs.k8s.io from {{ inventory_hostname }}.
+          VMs need internet access to install packages.
+          Check DNS (8.8.8.8) and NAT forwarding on the host.
+      when: internet_check.status is not defined or internet_check.status != 200
+
+- name: Configure all nodes
+  hosts: all
+  vars:
+    k8s_version: "1.36"
+    containerd_version: "1.7.*"
+  tasks:
+    # ---- Prerequisites ----
+    - name: Install prerequisite packages
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - software-properties-common
+        state: present
+
+    # ---- Kernel modules (idempotent re-check of cloud-init work) ----
+    - name: Ensure kernel modules are loaded
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    - name: Persist kernel modules
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+        mode: "0644"
+
+    - name: Set sysctl parameters
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: yes
+        state: present
+      loop:
+        - { key: "net.bridge.bridge-nf-call-iptables", value: "1" }
+        - { key: "net.bridge.bridge-nf-call-ip6tables", value: "1" }
+        - { key: "net.ipv4.ip_forward", value: "1" }
+
+    - name: Disable swap
+      command: swapoff -a
+      changed_when: false
+
+    - name: Remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '\sswap\s'
+        state: absent
+
+    # ---- Containerd ----
+    - name: Install containerd
+      apt:
+        name: "containerd"
+        state: present
+
+    - name: Create containerd config directory
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate default containerd config
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    - name: Enable SystemdCgroup in containerd
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+      notify: restart containerd
+
+    - name: Enable and start containerd
+      systemd:
+        name: containerd
+        enabled: yes
+        state: started
+
+    # ---- Kubernetes packages ----
+    - name: Create keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Kubernetes apt key
+      shell: >
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/Release.key
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add Kubernetes apt repository
+      copy:
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ k8s_version }}/deb/ /\n"
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: "0644"
+
+    - name: Install kubeadm, kubelet, kubectl
+      apt:
+        update_cache: yes
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+
+    - name: Hold Kubernetes packages at current version
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+
+  handlers:
+    - name: restart containerd
+      systemd:
+        name: containerd
+        state: restarted
+
+# ---- Control Plane Init ----
+- name: Initialize control plane
+  hosts: control_plane
+  tasks:
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: kubeadm_init_check
+
+    - name: Initialize Kubernetes control plane
+      command: >
+        kubeadm init
+        --apiserver-advertise-address={{ ansible_host }}
+        --pod-network-cidr=10.244.0.0/16
+        --node-name={{ inventory_hostname }}
+      register: kubeadm_init
+      when: not kubeadm_init_check.stat.exists
+
+    - name: Create .kube directory for kube user
+      file:
+        path: /home/kube/.kube
+        state: directory
+        owner: kube
+        group: kube
+        mode: "0755"
+
+    - name: Copy admin.conf to kube user
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/kube/.kube/config
+        remote_src: yes
+        owner: kube
+        group: kube
+        mode: "0600"
+
+    - name: Install Flannel CNI
+      become_user: kube
+      command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+      register: flannel_install
+      changed_when: "'created' in flannel_install.stdout"
+      when: not kubeadm_init_check.stat.exists
+
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Store join command
+      set_fact:
+        k8s_join_command: "{{ join_command.stdout }}"
+
+# ---- Worker Join ----
+- name: Join worker nodes
+  hosts: workers
+  tasks:
+    - name: Check if node already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_check
+
+    - name: Join cluster
+      command: >
+        {{ hostvars[groups['control_plane'][0]]['k8s_join_command'] }}
+        --node-name={{ inventory_hostname }}
+      when: not kubelet_check.stat.exists
+
+# ---- Verify ----
+- name: Verify cluster
+  hosts: control_plane
+  tasks:
+    - name: Wait for all nodes to be ready
+      become_user: kube
+      shell: kubectl get nodes --no-headers | grep -c " Ready "
+      register: ready_nodes
+      retries: 30
+      delay: 10
+      until: ready_nodes.stdout | int == groups['all'] | length
+      changed_when: false
+
+    - name: Display cluster status
+      become_user: kube
+      command: kubectl get nodes -o wide
+      register: cluster_status
+      changed_when: false
+
+    - name: Show cluster status
+      debug:
+        msg: "{{ cluster_status.stdout_lines }}"
+
+- name: Fetch kubeconfig to local machine
+  hosts: control_plane
+  tasks:
+    - name: Retrieve kubeconfig
+      fetch:
+        src: /home/kube/.kube/config
+        dest: ~/.kube/config
+        flat: yes

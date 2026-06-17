@@ -130,6 +130,92 @@ terraform destroy -auto-approve
 terraform destroy -auto-approve && terraform apply
 ```
 
+## What the Ansible Playbook Does (Bash Equivalent)
+
+These commands show what `k8s-setup.yml` executes on each node.
+Do not run these manually — use `ansible-playbook k8s-setup.yml` instead.
+
+# Install prerequisites (line 31)
+sudo apt-get update
+sudo apt-get install -y apt-transport-https ca-certificates curl gnupg
+
+# Load kernel modules (line 46)
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+# Persist modules (line 54)
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+# Set sysctl (line 61)
+echo "net.bridge.bridge-nf-call-iptables=1" | sudo tee -a /etc/sysctl.d/k8s.conf
+echo "net.bridge.bridge-nf-call-ip6tables=1" | sudo tee -a /etc/sysctl.d/k8s.conf
+echo "net.ipv4.ip_forward=1" | sudo tee -a /etc/sysctl.d/k8s.conf
+sudo sysctl --system
+
+# Disable swap (line 69)
+sudo swapoff -a
+sudo sed -i '/swap/d' /etc/fstab
+
+# Install containerd (line 77)
+sudo apt-get install -y containerd
+
+# Configure containerd (line 83-94)
+sudo mkdir -p /etc/containerd
+sudo containerd config default | sudo tee /etc/containerd/config.toml
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+
+# Add K8s repo (line 103-114)
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.35/deb/Release.key \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] \
+  https://pkgs.k8s.io/core:/stable:/v1.35/deb/ /" \
+  | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+# Install K8s packages (line 119)
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+sudo systemctl enable kubelet
+
+# --- Control plane only ---
+
+# Init cluster (line 146)
+sudo kubeadm init \
+  --apiserver-advertise-address=192.168.122.10 \
+  --pod-network-cidr=10.244.0.0/16 \
+  --node-name=k8s-control-plane
+
+# Setup kubectl (line 154-164)
+mkdir -p /home/kube/.kube
+sudo cp /etc/kubernetes/admin.conf /home/kube/.kube/config
+sudo chown kube:kube /home/kube/.kube/config
+
+# Install Flannel (line 166)
+kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
+
+# Get join command (line 172)
+kubeadm token create --print-join-command
+# outputs something like:
+# kubeadm join 192.168.122.10:6443 --token abc123 --discovery-token-ca-cert-hash sha256:xyz
+
+# --- Workers only ---
+
+# Join cluster (line 188)
+sudo kubeadm join 192.168.122.10:6443 \
+  --token abc123 \
+  --discovery-token-ca-cert-hash sha256:xyz \
+  --node-name=k8s-worker-1
+
+# Copy kubeconfig from control plane
+mkdir -p ~/.kube
+scp kube@192.168.122.10:~/.kube/config ~/.kube/config
+
 ## How It Works
 
 **Terraform** creates the infrastructure: a libvirt storage pool, downloads the Ubuntu 24.04 cloud image, creates thin-clone disks for each node, builds cloud-init ISOs with user/network configuration, and defines KVM domains (VMs).
